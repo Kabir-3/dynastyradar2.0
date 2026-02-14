@@ -1,0 +1,6 @@
+fastapi==0.116.1
+uvicorn==0.35.0
+numpy==1.26.4
+pandas==2.2.3
+requests==2.32.4
+pyarrow==21.0.0
