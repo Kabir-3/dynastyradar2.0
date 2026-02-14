@@ -1,3 +1,1 @@
-hosted on streamlit through github
-
-https://dynasty-radar.streamlit.app/
+https://dynastyradar2-0.vercel.app/
