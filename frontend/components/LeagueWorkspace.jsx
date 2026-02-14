@@ -187,6 +187,7 @@ export default function LeagueWorkspace() {
   const [qaSeasonTo, setQaSeasonTo] = useState(2025);
   const [qaMinGames, setQaMinGames] = useState(4);
   const [qaEwmaAlpha, setQaEwmaAlpha] = useState(0.6);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   useEffect(() => {
     try {
@@ -324,8 +325,29 @@ export default function LeagueWorkspace() {
     setBusy(true);
     setStatus(`Running lineup for ${myTeam}...`);
     try {
+      let mkt = market;
+      if (mkt.length === 0) {
+        const outMkt = await getJson(`${apiBase}/v1/market/default`);
+        mkt = outMkt.players || [];
+        setMarket(mkt);
+      }
+      const key = (name, pos) => `${String(name || "").toLowerCase().replace(/[^a-z0-9 ]/g, "").trim()}::${String(pos || "").toUpperCase()}`;
+      const marketMap = new Map(mkt.map((p) => [key(p.name, p.pos), Number(p.market_value || 0)]));
+      const valMap = new Map(
+        valuations
+          .filter((v) => v.display_name === myTeam)
+          .map((v) => [key(v.name, v.pos), Number(v.market_value || 0)])
+      );
       const out = await postJson(`${apiBase}/v1/lineup/recommend`, {
-        roster: myTeamRoster.map((p) => ({ name: p.name, pos: p.pos, team: p.team })),
+        roster: myTeamRoster.map((p) => {
+          const k = key(p.name, p.pos);
+          return {
+            name: p.name,
+            pos: p.pos,
+            team: p.team,
+            market_value: valMap.get(k) || marketMap.get(k) || 0,
+          };
+        }),
         superflex,
       });
       setLineup(out);
@@ -700,7 +722,7 @@ export default function LeagueWorkspace() {
       <div className="topbar panel">
         <div>
           <h1>Dynasty Radar</h1>
-          <p className="muted">Dark mode workspace with guided flows for each feature.</p>
+          <p className="muted">v2.0</p>
         </div>
         <div className="status-chip">{busy ? "Working..." : "Ready"}</div>
       </div>
@@ -708,14 +730,23 @@ export default function LeagueWorkspace() {
       <section className="panel stack">
         <div className="row">
           <label className="label grow">
-            API Base URL
-            <input className="input" value={apiBase} onChange={(e) => setApiBase(e.target.value)} />
-          </label>
-          <label className="label grow">
             Sleeper League ID
             <input className="input" value={leagueId} onChange={(e) => setLeagueId(e.target.value)} placeholder="1195252934627844096" />
           </label>
         </div>
+        <div className="row">
+          <button className="button" type="button" onClick={() => setShowAdvanced((v) => !v)}>
+            {showAdvanced ? "Hide Advanced" : "Show Advanced"}
+          </button>
+        </div>
+        {showAdvanced ? (
+          <div className="row">
+            <label className="label grow">
+              API Base URL
+              <input className="input" value={apiBase} onChange={(e) => setApiBase(e.target.value)} />
+            </label>
+          </div>
+        ) : null}
 
         <div className="row">
           <label className="label grow">

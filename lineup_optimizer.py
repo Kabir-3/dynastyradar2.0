@@ -82,7 +82,10 @@ def project_points_this_week(
         mv = _safe_num(x["market_value"])
         pct = mv.groupby(x["pos"]).rank(pct=True, method="average")
         base_pts = x["pos"].map({"QB": 16.0, "RB": 11.5, "WR": 11.0, "TE": 9.0, "K": 8.0}).fillna(10.0)
+        # Preserve a non-zero positional floor even when market is missing.
+        prior_floor = x["pos"].map({"QB": 8.0, "RB": 6.0, "WR": 6.0, "TE": 5.0, "K": 4.0}).fillna(5.0)
         proj_fallback = (pct.fillna(0.0) * base_pts).astype(float)
+        proj_fallback = np.maximum(proj_fallback, prior_floor)
         proj = proj.where(~no_signal, proj_fallback)
 
     # TE premium nudge if desired (very light; keep logic simple here)
