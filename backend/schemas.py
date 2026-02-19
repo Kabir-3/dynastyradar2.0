@@ -233,6 +233,9 @@ class TradeEvaluateResponse(BaseModel):
     package_quality_diff: float = 0.0
     deal_score: float = 0.0
     deal_verdict: str = "neutral"
+    acceptance_likelihood_pct: float = 50.0
+    partner_acceptance: str = "medium"
+    warnings: List[str] = Field(default_factory=list)
 
 
 class FAUpgradesRequest(BaseModel):

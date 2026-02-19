@@ -357,6 +357,9 @@ def build_trade_evaluation(request: TradeEvaluateRequest) -> Dict[str, Any]:
             "package_quality_diff": 0.0,
             "deal_score": 0.0,
             "deal_verdict": "neutral",
+            "acceptance_likelihood_pct": 50.0,
+            "partner_acceptance": "medium",
+            "warnings": [],
         }
 
     df = pd.DataFrame([p.model_dump() for p in request.players])
@@ -434,6 +437,33 @@ def build_trade_evaluation(request: TradeEvaluateRequest) -> Dict[str, Any]:
     else:
         verdict = "neutral"
 
+    # Realism layer: estimate whether partner would ever accept this structure.
+    send_count = int(len(send_df))
+    recv_count = int(len(recv_df))
+    send_top = float(send_ra.fillna(0.0).max()) if send_count else 0.0
+    recv_top = float(recv_ra.fillna(0.0).max()) if recv_count else 0.0
+    top_gap = recv_top - send_top
+    warnings: List[str] = []
+    if recv_top > (send_top * 1.30) and recv_count <= send_count:
+        warnings.append("Star mismatch: package lacks a comparable centerpiece asset.")
+    if abs(send_count - recv_count) >= 2:
+        warnings.append("Large player-count imbalance can reduce acceptance odds.")
+    if quality_diff > 0 and (recv_total_risk_adj - send_total_risk_adj) > 0:
+        warnings.append("You receive more consolidated value than you send; likely countered.")
+
+    acceptance = 68.0
+    acceptance -= max(0.0, quality_diff) * 1.15
+    acceptance -= max(0.0, recv_total_risk_adj - send_total_risk_adj) * 0.65
+    acceptance -= max(0.0, top_gap) * 0.90
+    acceptance -= abs(send_count - recv_count) * 4.0
+    acceptance = float(np.clip(acceptance, 1.0, 99.0))
+    if acceptance >= 70:
+        partner_acceptance = "high"
+    elif acceptance >= 40:
+        partner_acceptance = "medium"
+    else:
+        partner_acceptance = "low"
+
     candidate_cols = [
         "name",
         "pos",
@@ -462,6 +492,9 @@ def build_trade_evaluation(request: TradeEvaluateRequest) -> Dict[str, Any]:
         "package_quality_diff": float(quality_diff),
         "deal_score": deal_score,
         "deal_verdict": verdict,
+        "acceptance_likelihood_pct": acceptance,
+        "partner_acceptance": partner_acceptance,
+        "warnings": warnings,
     }
 
 

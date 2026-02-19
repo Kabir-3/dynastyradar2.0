@@ -163,6 +163,7 @@ function SortableTable({ title, rows, defaultSortKey, limit = 60 }) {
 
 export default function LeagueWorkspace() {
   const [apiBase, setApiBase] = useState(DEFAULT_API);
+  const [backendReady, setBackendReady] = useState(null);
   const [leagueId, setLeagueId] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("idle");
@@ -206,6 +207,27 @@ export default function LeagueWorkspace() {
       // ignore malformed local storage
     }
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    async function pingBackend() {
+      try {
+        setBackendReady(false);
+        await getJson(`${apiBase}/health`);
+        if (active) {
+          setBackendReady(true);
+        }
+      } catch {
+        if (active) {
+          setBackendReady(false);
+        }
+      }
+    }
+    pingBackend();
+    return () => {
+      active = false;
+    };
+  }, [apiBase]);
 
   const teams = useMemo(() => {
     const uniq = new Set();
@@ -635,6 +657,10 @@ export default function LeagueWorkspace() {
                   <p><strong>Risk-Adjusted:</strong> send {Number(tradeEval.send_total_risk_adjusted_value || 0).toFixed(1)} | receive {Number(tradeEval.receive_total_risk_adjusted_value || 0).toFixed(1)} | diff {Number(tradeEval.risk_adjusted_value_diff || 0).toFixed(1)}</p>
                   <p><strong>Package Quality:</strong> send {Number(tradeEval.send_package_quality || 0).toFixed(1)} | receive {Number(tradeEval.receive_package_quality || 0).toFixed(1)} | diff {Number(tradeEval.package_quality_diff || 0).toFixed(1)}</p>
                   <p><strong>Deal Score:</strong> {Number(tradeEval.deal_score || 0).toFixed(1)} | <strong>Verdict:</strong> {String(tradeEval.deal_verdict || "neutral")}</p>
+                  <p><strong>Partner Acceptance:</strong> {String(tradeEval.partner_acceptance || "medium")} ({Number(tradeEval.acceptance_likelihood_pct || 0).toFixed(0)}%)</p>
+                  {(tradeEval.warnings || []).length > 0 ? (
+                    <p className="muted"><strong>Warnings:</strong> {(tradeEval.warnings || []).join(" | ")}</p>
+                  ) : null}
                   <p><strong>Fairness:</strong> {tradeEval.fairness_score.toFixed(3)} (closer to 1.0 is more balanced)</p>
                 </div>
               ) : null}
@@ -724,7 +750,9 @@ export default function LeagueWorkspace() {
           <h1>Dynasty Radar</h1>
           <p className="muted">v2.0</p>
         </div>
-        <div className="status-chip">{busy ? "Working..." : "Ready"}</div>
+        <div className="status-chip">
+          {busy ? "Working..." : backendReady === false ? "Waking API..." : "Ready"}
+        </div>
       </div>
 
       <section className="panel stack">
