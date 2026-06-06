@@ -1,7 +1,0 @@
-module.exports = [
-"[project]/Downloads/new dynasty app/frontend/.next-internal/server/app/valuations/page/actions.js [app-rsc] (server actions loader, ecmascript)", ((__turbopack_context__, module, exports) => {
-
-}),
-];
-
-//# sourceMappingURL=349c7_frontend__next-internal_server_app_valuations_page_actions_2fca2706.js.map

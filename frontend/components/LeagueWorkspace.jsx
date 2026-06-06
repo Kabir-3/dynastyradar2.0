@@ -1,10 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const DEFAULT_API = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000";
 const LS_KEY = "dynasty_radar_league_players";
 const LS_KEY_ID = "dynasty_radar_league_id";
+const LS_KEY_HUB = "dynasty_radar_league_hub";
+const LS_KEY_USERNAME = "dynasty_radar_sleeper_username";
+const LS_KEY_LEAGUES = "dynasty_radar_sleeper_leagues";
 const TABS = ["overview", "league", "valuations", "lineup", "trade", "fa", "model"];
 
 async function postJson(url, payload) {
@@ -47,6 +50,459 @@ function StatCard({ label, value }) {
       <p className="stat-label">{label}</p>
       <p className="stat-value">{value}</p>
     </div>
+  );
+}
+
+function avatarUrl(avatar) {
+  return avatar ? `https://sleepercdn.com/avatars/thumbs/${avatar}` : "";
+}
+
+function playerImageUrl(player) {
+  const id = player?.player_id || player?.sleeper_id || player?.id;
+  return id ? `https://sleepercdn.com/content/nfl/players/${id}.jpg` : "";
+}
+
+function PlayerImage({ player, className = "" }) {
+  const src = playerImageUrl(player);
+  if (!src) {
+    return <div className={`player-image-fallback ${className}`} aria-hidden="true" />;
+  }
+  return (
+    <img
+      className={className}
+      src={src}
+      alt=""
+      onError={(event) => {
+        event.currentTarget.style.visibility = "hidden";
+      }}
+    />
+  );
+}
+
+function recordFromRoster(roster) {
+  const wins = roster?.settings?.wins ?? 0;
+  const losses = roster?.settings?.losses ?? 0;
+  const ties = roster?.settings?.ties ?? 0;
+  return ties ? `${wins}-${losses}-${ties}` : `${wins}-${losses}`;
+}
+
+function rosterPoints(roster, key, decimalKey) {
+  return Number(`${roster?.settings?.[key] || 0}.${roster?.settings?.[decimalKey] || 0}`);
+}
+
+async function fetchSleeperHub(leagueId, week = 1) {
+  const [leagueRes, usersRes, rostersRes, matchupsRes] = await Promise.all([
+    fetch(`https://api.sleeper.app/v1/league/${leagueId}`),
+    fetch(`https://api.sleeper.app/v1/league/${leagueId}/users`),
+    fetch(`https://api.sleeper.app/v1/league/${leagueId}/rosters`),
+    fetch(`https://api.sleeper.app/v1/league/${leagueId}/matchups/${week}`),
+  ]);
+
+  if (!leagueRes.ok || !usersRes.ok || !rostersRes.ok || !matchupsRes.ok) {
+    throw new Error("Sleeper league data failed to load.");
+  }
+
+  const [league, users, rosters, rows] = await Promise.all([
+    leagueRes.json(),
+    usersRes.json(),
+    rostersRes.json(),
+    matchupsRes.json(),
+  ]);
+
+  const usersById = new Map((users || []).map((u) => [u.user_id, u]));
+  const rostersById = new Map((rosters || []).map((r) => [r.roster_id, r]));
+
+  function teamFromRoster(roster) {
+    const user = usersById.get(roster?.owner_id);
+    const name = user?.metadata?.team_name || user?.display_name || `Roster ${roster?.roster_id}`;
+    return {
+      roster_id: roster?.roster_id,
+      team_name: name,
+      owner_name: user?.display_name || "Unknown Owner",
+      avatar: avatarUrl(user?.avatar),
+      record: recordFromRoster(roster),
+      wins: roster?.settings?.wins ?? 0,
+      losses: roster?.settings?.losses ?? 0,
+      points_for: rosterPoints(roster, "fpts", "fpts_decimal"),
+      points_against: rosterPoints(roster, "fpts_against", "fpts_against_decimal"),
+    };
+  }
+
+  const teams = (rosters || [])
+    .map(teamFromRoster)
+    .sort((a, b) => b.wins - a.wins || b.points_for - a.points_for);
+
+  const buckets = new Map();
+  for (const row of rows || []) {
+    if (!row.matchup_id) continue;
+    const bucket = buckets.get(row.matchup_id) || [];
+    bucket.push(row);
+    buckets.set(row.matchup_id, bucket);
+  }
+
+  const matchups = [...buckets.entries()]
+    .map(([id, matchupRows]) => {
+      if (matchupRows.length < 2) return null;
+      return {
+        id,
+        week,
+        home: teamFromRoster(rostersById.get(matchupRows[0].roster_id)),
+        away: teamFromRoster(rostersById.get(matchupRows[1].roster_id)),
+        home_points: matchupRows[0].points ?? 0,
+        away_points: matchupRows[1].points ?? 0,
+      };
+    })
+    .filter(Boolean);
+
+  return { league, teams, matchups, week };
+}
+
+async function fetchSleeperUserLeagues(username, season) {
+  const cleanUsername = username.trim();
+  if (!cleanUsername) {
+    throw new Error("Enter a Sleeper username first.");
+  }
+
+  const user = await getJson(`https://api.sleeper.app/v1/user/${encodeURIComponent(cleanUsername)}`);
+  if (!user?.user_id) {
+    throw new Error("Sleeper user not found.");
+  }
+
+  async function loadSeason(year) {
+    const leagues = await getJson(`https://api.sleeper.app/v1/user/${user.user_id}/leagues/nfl/${year}`);
+    return (leagues || []).map((league) => ({ ...league, season: String(year) }));
+  }
+
+  let leagues = await loadSeason(season);
+  if (leagues.length === 0) {
+    leagues = await loadSeason(Number(season) - 1);
+  }
+
+  return {
+    user,
+    leagues: leagues.sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""))),
+  };
+}
+
+function ScoreTicker({ matchups }) {
+  const items = matchups && matchups.length > 0
+    ? matchups
+    : [
+        { id: "empty-1", week: 1, home: { team_name: "Enter a league ID" }, away: { team_name: "Build dashboard" }, home_points: 0, away_points: 0 },
+        { id: "empty-2", week: 1, home: { team_name: "Radar Rankings" }, away: { team_name: "Trade Lab" }, home_points: 0, away_points: 0 },
+      ];
+
+  return (
+    <div className="score-ticker" aria-label="League matchups">
+      <div className="ticker-label">Top Matchups</div>
+      <div className="ticker-track">
+        {items.slice(0, 8).map((m) => (
+          <div className="ticker-card" key={m.id}>
+            <div className="ticker-meta">
+              <span>Week {m.week}</span>
+              <strong>Preview</strong>
+            </div>
+            <div className="ticker-team">
+              {m.home?.avatar ? <img src={m.home.avatar} alt="" /> : null}
+              <span>{m.home?.team_name}</span>
+              <em>{m.home?.record || "0-0"}</em>
+              <strong>{Number(m.home_points || 0).toFixed(1)}</strong>
+            </div>
+            <div className="ticker-team">
+              {m.away?.avatar ? <img src={m.away.avatar} alt="" /> : null}
+              <span>{m.away?.team_name}</span>
+              <em>{m.away?.record || "0-0"}</em>
+              <strong>{Number(m.away_points || 0).toFixed(1)}</strong>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RankingList({ title, players, emptyText = "Run valuations to fill this board." }) {
+  return (
+    <section className="dashboard-card">
+      <div className="section-kicker">{title}</div>
+      <div className="rank-list">
+        {players.length === 0 ? <p className="muted">{emptyText}</p> : null}
+        {players.slice(0, 12).map((player, index) => (
+          <div className="rank-row" key={`${title}-${player.name}-${index}`}>
+            <span className="rank-number">{index + 1}</span>
+            <PlayerImage player={player} />
+            <div>
+              <strong>{player.name}</strong>
+              <p>{player.pos || "-"} {player.team ? `- ${player.team}` : ""}</p>
+            </div>
+            <em>{Number(player.risk_adjusted_value || player.true_value || 0).toFixed(1)}</em>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function StandingsBoard({ teams }) {
+  return (
+    <section className="dashboard-card">
+      <div className="section-kicker">Standings</div>
+      <div className="standings-list">
+        {teams.length === 0 ? <p className="muted">Load a league to see teams.</p> : null}
+        {teams.slice(0, 14).map((team, index) => (
+          <div className="standing-row" key={team.roster_id || team.team_name}>
+            <span>{index + 1}</span>
+            {team.avatar ? <img src={team.avatar} alt="" /> : <div className="avatar-fallback" />}
+            <div>
+              <strong>{team.team_name}</strong>
+              <p>@{team.owner_name}</p>
+            </div>
+            <em>{team.record}</em>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MatchupBoard({ matchups }) {
+  return (
+    <section className="dashboard-card dashboard-card--wide">
+      <div className="section-kicker">Week Matchups</div>
+      <div className="matchup-grid">
+        {matchups.length === 0 ? <p className="muted">Matchups will appear after loading a Sleeper league.</p> : null}
+        {matchups.map((m) => (
+          <div className="matchup-tile" key={m.id}>
+            <div className="matchup-side">
+              {m.home?.avatar ? <img src={m.home.avatar} alt="" /> : null}
+              <strong>{m.home?.team_name}</strong>
+              <span>{m.home?.record}</span>
+            </div>
+            <div className="matchup-center">
+              <p>{Number(m.home_points || 0).toFixed(1)}</p>
+              <strong>VS</strong>
+              <p>{Number(m.away_points || 0).toFixed(1)}</p>
+            </div>
+            <div className="matchup-side matchup-side--right">
+              {m.away?.avatar ? <img src={m.away.avatar} alt="" /> : null}
+              <strong>{m.away?.team_name}</strong>
+              <span>{m.away?.record}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ActionCard({ title, body, button, disabled, onClick }) {
+  return (
+    <article className="action-card">
+      <div>
+        <strong>{title}</strong>
+        <p>{body}</p>
+      </div>
+      <button className="button" type="button" disabled={disabled} onClick={onClick}>
+        {button}
+      </button>
+    </article>
+  );
+}
+
+function PlayerMiniCard({ player, label }) {
+  if (!player) return null;
+  return (
+    <div className="player-mini-card">
+      <PlayerImage player={player} />
+      <div>
+        <span>{label}</span>
+        <strong>{player.name}</strong>
+        <p>{player.pos || "-"} {player.team ? `- ${player.team}` : ""}</p>
+      </div>
+      <em>{Number(player.risk_adjusted_value || player.true_value || 0).toFixed(1)}</em>
+    </div>
+  );
+}
+
+function valueKey(name, pos) {
+  return `${String(name || "").toLowerCase().replace(/[^a-z0-9 ]/g, "").trim()}::${String(pos || "").toUpperCase()}`;
+}
+
+function enrichPlayer(row, valuations) {
+  const match = valuations.find((player) => (
+    valueKey(player.name, player.pos) === valueKey(row?.name, row?.pos)
+  ));
+  return { ...row, ...(match || {}) };
+}
+
+function LineupBoard({ lineup, valuations, teamName, teams, onTeamChange }) {
+  const starters = (lineup?.starters || []).map((row) => enrichPlayer(row, valuations));
+  const bench = (lineup?.bench || []).map((row) => enrichPlayer(row, valuations));
+
+  return (
+    <section className="dashboard-card dashboard-card--wide lineup-board">
+      <div className="lineup-board-header">
+        <div>
+          <div className="section-kicker">Recommended Lineup</div>
+          <h3>{teamName || "Select a team"}</h3>
+        </div>
+        <label className="label lineup-team-picker">
+          Team
+          <select className="input compact-select" value={teamName} onChange={(e) => onTeamChange(e.target.value)}>
+            <option value="">View lineup...</option>
+            {teams.map((t) => (
+              <option key={t} value={t}>{t}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {!lineup ? <p className="muted">Lineup will load automatically with the dashboard.</p> : null}
+      {lineup ? (
+        <>
+          <div className="lineup-total">
+            <strong>{Number(lineup.total_projected_points || 0).toFixed(1)}</strong>
+            <span>projected starter points</span>
+          </div>
+          <div className="lineup-slot-grid">
+            {starters.map((player) => (
+              <div className="lineup-slot" key={`${player.slot}-${player.name}`}>
+                <span>{player.slot || player.pos}</span>
+                <PlayerImage player={player} />
+                <strong>{player.name}</strong>
+                <p>{player.pos} - {player.team || "-"}</p>
+                <em>{Number(player.proj_week || 0).toFixed(1)}</em>
+              </div>
+            ))}
+          </div>
+          <div className="bench-strip">
+            {bench.slice(0, 10).map((player) => (
+              <PlayerMiniCard key={`bench-${player.name}`} player={player} label="Bench" />
+            ))}
+          </div>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
+function FaBoard({ fa }) {
+  const upgrades = fa?.upgrades || [];
+  const faPool = fa?.fa_pool || [];
+
+  return (
+    <section className="dashboard-card dashboard-card--wide fa-board">
+      <div className="section-kicker">Free-Agent Upgrades</div>
+      {!fa ? <p className="muted">FA upgrades will load automatically with the dashboard.</p> : null}
+      {fa ? (
+        <>
+          <div className="lineup-total">
+            <strong>{Number(fa.total_projected_points || 0).toFixed(1)}</strong>
+            <span>current projected team points</span>
+          </div>
+          <div className="fa-upgrade-grid">
+            {upgrades.slice(0, 8).map((item, index) => {
+              const add = item.add || item.free_agent || item.fa || item;
+              const drop = item.drop || item.replace || item.roster_player;
+              return (
+                <div className="fa-card" key={`${add?.name || index}-${drop?.name || index}`}>
+                  <div>
+                    <span>Add</span>
+                    <strong>{add?.name || item.name || "Free agent"}</strong>
+                    <p>{add?.pos || item.pos || "-"} {add?.team || item.team ? `- ${add?.team || item.team}` : ""}</p>
+                  </div>
+                  <em>+{Number(item.delta_pts || item.delta || 0).toFixed(1)}</em>
+                  {drop ? (
+                    <div>
+                      <span>Drop</span>
+                      <strong>{drop.name}</strong>
+                      <p>{drop.pos || "-"} {drop.team ? `- ${drop.team}` : ""}</p>
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+            {upgrades.length === 0 ? <p className="muted">No obvious upgrades found yet.</p> : null}
+          </div>
+          <RankingList title="Best Available Players" players={faPool.slice(0, 12)} emptyText="No free-agent pool returned." />
+        </>
+      ) : null}
+    </section>
+  );
+}
+
+function MyTeamSnapshot({ teamName, teams, players, onTeamChange }) {
+  const topAssets = players.slice(0, 6);
+  const risky = [...players]
+    .sort((a, b) => Number(b.risk_index || 0) - Number(a.risk_index || 0))
+    .slice(0, 4);
+  const positions = players.reduce((acc, player) => {
+    acc[player.pos || "OTHER"] = (acc[player.pos || "OTHER"] || 0) + 1;
+    return acc;
+  }, {});
+
+  return (
+    <section className="dashboard-card dashboard-card--wide command-center-card">
+      <div className="section-kicker">My Team Command Center</div>
+      <div className="team-command-grid">
+        <div>
+          <div className="team-command-header">
+            <h3>{teamName || "Select a team"}</h3>
+            <select className="input compact-select" value={teamName} onChange={(e) => onTeamChange(e.target.value)}>
+              <option value="">View as team...</option>
+              {teams.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
+          </div>
+          <p className="muted">
+            Start here for the weekly loop: check your core, set lineup, scan free agents, then build trades.
+          </p>
+          <div className="position-pills">
+            {["QB", "RB", "WR", "TE"].map((pos) => (
+              <span key={pos}>{pos}: {positions[pos] || 0}</span>
+            ))}
+          </div>
+        </div>
+        <div className="mini-card-stack">
+          {topAssets.map((player, index) => (
+            <PlayerMiniCard key={`asset-${player.name}`} player={player} label={index === 0 ? "Franchise Piece" : "Core Asset"} />
+          ))}
+          {players.length === 0 ? <p className="muted">Run valuations to see your team snapshot.</p> : null}
+        </div>
+        <div className="mini-card-stack">
+          {risky.map((player) => (
+            <PlayerMiniCard key={`risk-${player.name}`} player={player} label="Watch List" />
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ValuationStory({ myTeam, topPlayers, valueLeaders, myTeamPlayers, onTrade }) {
+  const topAsset = myTeamPlayers[0];
+  const bestValue = valueLeaders.find((p) => p.display_name === myTeam) || valueLeaders[0];
+  const leagueMvp = topPlayers[0];
+
+  return (
+    <section className="dashboard-card valuation-story">
+      <div className="section-kicker">What This Means</div>
+      <div className="story-grid">
+        <PlayerMiniCard player={topAsset} label="Your Top Asset" />
+        <PlayerMiniCard player={bestValue} label="Best Value Signal" />
+        <PlayerMiniCard player={leagueMvp} label="League Benchmark" />
+      </div>
+      <div className="story-copy">
+        <h3>Use valuations as decisions, not just rankings.</h3>
+        <p>
+          Treat top assets as your core, value edges as buy/hold signals, and high-risk names as players to review
+          before you reject a trade or ignore waivers.
+        </p>
+        <button className="button ghost-button" type="button" disabled={!myTeamPlayers.length} onClick={onTrade}>
+          Turn This Into A Trade
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -165,6 +621,10 @@ export default function LeagueWorkspace() {
   const [apiBase, setApiBase] = useState(DEFAULT_API);
   const [backendReady, setBackendReady] = useState(null);
   const [leagueId, setLeagueId] = useState("");
+  const [sleeperUsername, setSleeperUsername] = useState("");
+  const [sleeperUser, setSleeperUser] = useState(null);
+  const [sleeperLeagues, setSleeperLeagues] = useState([]);
+  const [sleeperSeason, setSleeperSeason] = useState(new Date().getFullYear());
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("idle");
   const [tab, setTab] = useState("overview");
@@ -177,18 +637,22 @@ export default function LeagueWorkspace() {
   const [fa, setFa] = useState(null);
   const [modelQa, setModelQa] = useState(null);
   const [market, setMarket] = useState([]);
+  const [hub, setHub] = useState(null);
 
   const [selectedSend, setSelectedSend] = useState([]);
   const [selectedReceive, setSelectedReceive] = useState([]);
 
   const [myTeam, setMyTeam] = useState("");
   const [partner, setPartner] = useState("");
-  const [superflex, setSuperflex] = useState(true);
+  const [superflex, setSuperflex] = useState(false);
   const [qaSeasonFrom, setQaSeasonFrom] = useState(2021);
   const [qaSeasonTo, setQaSeasonTo] = useState(2025);
   const [qaMinGames, setQaMinGames] = useState(4);
   const [qaEwmaAlpha, setQaEwmaAlpha] = useState(0.6);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const bootstrappedLeagueRef = useRef("");
+  const tradeAutoKeyRef = useRef("");
+  const lineupAutoKeyRef = useRef("");
 
   useEffect(() => {
     try {
@@ -202,6 +666,21 @@ export default function LeagueWorkspace() {
       }
       if (rawId) {
         setLeagueId(rawId);
+      }
+      const rawUsername = localStorage.getItem(LS_KEY_USERNAME);
+      if (rawUsername) {
+        setSleeperUsername(rawUsername);
+      }
+      const rawLeagues = localStorage.getItem(LS_KEY_LEAGUES);
+      if (rawLeagues) {
+        const parsedLeagues = JSON.parse(rawLeagues);
+        if (Array.isArray(parsedLeagues)) {
+          setSleeperLeagues(parsedLeagues);
+        }
+      }
+      const rawHub = localStorage.getItem(LS_KEY_HUB);
+      if (rawHub) {
+        setHub(JSON.parse(rawHub));
       }
     } catch {
       // ignore malformed local storage
@@ -229,6 +708,21 @@ export default function LeagueWorkspace() {
     };
   }, [apiBase]);
 
+  useEffect(() => {
+    if (!leagueId.trim() || backendReady !== true || busy) {
+      return;
+    }
+    if (bootstrappedLeagueRef.current === leagueId.trim()) {
+      return;
+    }
+    if (leaguePlayers.length > 0 && valuations.length > 0) {
+      bootstrappedLeagueRef.current = leagueId.trim();
+      return;
+    }
+    bootstrappedLeagueRef.current = leagueId.trim();
+    buildDashboard();
+  }, [backendReady, leagueId]);
+
   const teams = useMemo(() => {
     const uniq = new Set();
     for (const p of leaguePlayers) {
@@ -245,9 +739,42 @@ export default function LeagueWorkspace() {
   );
 
   const myTeamValuations = useMemo(
-    () => valuations.filter((p) => p.display_name === myTeam),
+    () => valuations
+      .filter((p) => p.display_name === myTeam)
+      .sort((a, b) => Number(b.risk_adjusted_value || b.true_value || 0) - Number(a.risk_adjusted_value || a.true_value || 0)),
     [valuations, myTeam]
   );
+
+  const topPlayers = useMemo(() => {
+    return [...valuations]
+      .sort((a, b) => Number(b.risk_adjusted_value || b.true_value || 0) - Number(a.risk_adjusted_value || a.true_value || 0))
+      .slice(0, 25);
+  }, [valuations]);
+
+  const valueLeaders = useMemo(() => {
+    return [...valuations]
+      .filter((p) => Number.isFinite(Number(p.edge || p.edge_z_adj)))
+      .sort((a, b) => Number(b.edge_z_adj || b.edge || 0) - Number(a.edge_z_adj || a.edge || 0))
+      .slice(0, 12);
+  }, [valuations]);
+
+  const teamPower = useMemo(() => {
+    const buckets = new Map();
+    for (const player of valuations) {
+      const team = player.display_name || "Unknown";
+      const bucket = buckets.get(team) || { team, total: 0, starters: 0, count: 0 };
+      const value = Number(player.risk_adjusted_value || player.true_value || 0);
+      bucket.total += value;
+      bucket.count += 1;
+      if (["QB", "RB", "WR", "TE"].includes(player.pos)) {
+        bucket.starters += value;
+      }
+      buckets.set(team, bucket);
+    }
+    return [...buckets.values()]
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 10);
+  }, [valuations]);
 
   useEffect(() => {
     if (!myTeam && teams.length > 0) {
@@ -266,6 +793,30 @@ export default function LeagueWorkspace() {
     ? trade.receive_candidates
     : (trade?.partner_pool || []);
 
+  useEffect(() => {
+    if (tab !== "trade" || busy || valuations.length === 0 || !myTeam || !partner) {
+      return;
+    }
+    const key = `${myTeam}::${partner}::${valuations.length}`;
+    if (tradeAutoKeyRef.current === key) {
+      return;
+    }
+    tradeAutoKeyRef.current = key;
+    runTradeTargets();
+  }, [tab, myTeam, partner, valuations.length]);
+
+  useEffect(() => {
+    if (tab !== "lineup" || busy || valuations.length === 0 || !myTeam || myTeamRoster.length === 0) {
+      return;
+    }
+    const key = `${myTeam}::${valuations.length}::${superflex}`;
+    if (lineupAutoKeyRef.current === key) {
+      return;
+    }
+    lineupAutoKeyRef.current = key;
+    runLineup();
+  }, [tab, myTeam, valuations.length, myTeamRoster.length, superflex]);
+
   function tabLabel(t) {
     const map = {
       overview: "Overview",
@@ -279,17 +830,22 @@ export default function LeagueWorkspace() {
     return map[t] || t;
   }
 
-  async function loadLeague() {
-    if (!leagueId.trim()) {
+  async function loadLeague(nextLeagueId = leagueId) {
+    if (!String(nextLeagueId).trim()) {
       setStatus("Enter a Sleeper league ID first.");
       return;
     }
     setBusy(true);
     setStatus("Loading league...");
     try {
-      const out = await postJson(`${apiBase}/v1/league/load`, { league_id: leagueId.trim() });
+      const trimmedLeagueId = String(nextLeagueId).trim();
+      const [out, sleeperHub] = await Promise.all([
+        postJson(`${apiBase}/v1/league/load`, { league_id: trimmedLeagueId }),
+        fetchSleeperHub(trimmedLeagueId).catch(() => null),
+      ]);
       const players = out.players || [];
       setLeaguePlayers(players);
+      setHub(sleeperHub);
       setValuations([]);
       setLineup(null);
       setTrade(null);
@@ -298,14 +854,166 @@ export default function LeagueWorkspace() {
       setSelectedSend([]);
       setSelectedReceive([]);
       localStorage.setItem(LS_KEY, JSON.stringify(players));
-      localStorage.setItem(LS_KEY_ID, leagueId.trim());
+      localStorage.setItem(LS_KEY_ID, trimmedLeagueId);
+      if (sleeperHub) {
+        localStorage.setItem(LS_KEY_HUB, JSON.stringify(sleeperHub));
+      }
       setStatus(`Loaded ${players.length} players across ${new Set(players.map((p) => p.display_name)).size} teams.`);
-      setTab("league");
+      setTab("overview");
     } catch (err) {
       setStatus(`Load failed: ${err.message}`);
     } finally {
       setBusy(false);
     }
+  }
+
+  async function buildDashboard(nextLeagueId = leagueId) {
+    if (!String(nextLeagueId).trim()) {
+      setStatus("Enter a Sleeper league ID first.");
+      return;
+    }
+    setBusy(true);
+    setStatus("Building league dashboard...");
+    try {
+      const trimmedLeagueId = String(nextLeagueId).trim();
+      setLeagueId(trimmedLeagueId);
+      const [out, sleeperHub, outMkt] = await Promise.all([
+        postJson(`${apiBase}/v1/league/load`, { league_id: trimmedLeagueId }),
+        fetchSleeperHub(trimmedLeagueId).catch(() => null),
+        market.length > 0 ? Promise.resolve({ players: market }) : getJson(`${apiBase}/v1/market/default`),
+      ]);
+      const players = out.players || [];
+      const mkt = outMkt.players || [];
+      const outVals = await postJson(`${apiBase}/v1/valuations`, {
+        roster: players,
+        market: mkt,
+        superflex,
+        ppr: true,
+      });
+      const valuedPlayers = outVals.players || [];
+      const dashboardTeams = [...new Set(players.map((p) => p.display_name).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+      const defaultTeam = dashboardTeams.includes(myTeam) ? myTeam : dashboardTeams[0] || "";
+      const defaultPartner = dashboardTeams.includes(partner) && partner !== defaultTeam
+        ? partner
+        : dashboardTeams.find((team) => team !== defaultTeam) || "";
+      const defaultRoster = players.filter((p) => p.display_name === defaultTeam);
+      const marketMap = new Map(mkt.map((p) => [valueKey(p.name, p.pos), Number(p.market_value || 0)]));
+      const valMap = new Map(
+        valuedPlayers
+          .filter((v) => v.display_name === defaultTeam)
+          .map((v) => [valueKey(v.name, v.pos), Number(v.market_value || 0)])
+      );
+      const valuationPayload = valuedPlayers.map((v) => ({
+        name: v.name,
+        pos: v.pos,
+        display_name: v.display_name,
+        true_value: v.true_value,
+        risk_adjusted_value: v.risk_adjusted_value,
+        floor_value: v.floor_value,
+        ceiling_value: v.ceiling_value,
+        confidence: v.confidence,
+        risk_index: v.risk_index,
+        market_value: v.market_value,
+        edge: v.edge,
+        edge_z_adj: v.edge_z_adj,
+        WinNowScore: v.WinNowScore,
+      }));
+      const [lineupResult, faResult, tradeResult] = await Promise.allSettled([
+        defaultRoster.length > 0 ? postJson(`${apiBase}/v1/lineup/recommend`, {
+          roster: defaultRoster.map((p) => {
+            const k = valueKey(p.name, p.pos);
+            return {
+              name: p.name,
+              pos: p.pos,
+              team: p.team,
+              market_value: valMap.get(k) || marketMap.get(k) || 0,
+            };
+          }),
+          superflex,
+        }) : Promise.resolve(null),
+        defaultRoster.length > 0 ? postJson(`${apiBase}/v1/fa/upgrades`, {
+          roster: defaultRoster.map((p) => ({ name: p.name, pos: p.pos, team: p.team })),
+          league_roster: players.map((p) => ({
+            name: p.name,
+            pos: p.pos,
+            display_name: p.display_name,
+            team: p.team,
+          })),
+          dp_market: mkt,
+          superflex,
+        }) : Promise.resolve(null),
+        defaultTeam && defaultPartner ? postJson(`${apiBase}/v1/trade/targets`, {
+          my_team: defaultTeam,
+          partner: defaultPartner,
+          players: valuationPayload,
+        }) : Promise.resolve(null),
+      ]);
+      setLeaguePlayers(players);
+      setHub(sleeperHub);
+      setMarket(mkt);
+      setValuations(valuedPlayers);
+      setMyTeam(defaultTeam);
+      setPartner(defaultPartner);
+      setLineup(lineupResult.status === "fulfilled" ? lineupResult.value : null);
+      setTrade(tradeResult.status === "fulfilled" ? tradeResult.value : null);
+      setTradeEval(null);
+      setFa(faResult.status === "fulfilled" ? faResult.value : null);
+      setSelectedSend([]);
+      setSelectedReceive([]);
+      localStorage.setItem(LS_KEY, JSON.stringify(players));
+      localStorage.setItem(LS_KEY_ID, trimmedLeagueId);
+      if (sleeperHub) {
+        localStorage.setItem(LS_KEY_HUB, JSON.stringify(sleeperHub));
+      }
+      bootstrappedLeagueRef.current = trimmedLeagueId;
+      setTab("overview");
+      setStatus(`Dashboard ready: ${players.length} players, ${outVals.players?.length || 0} valuations.`);
+    } catch (err) {
+      setStatus(`Dashboard failed: ${err.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function submitLeagueId(event) {
+    event.preventDefault();
+    bootstrappedLeagueRef.current = "";
+    buildDashboard();
+  }
+
+  async function submitSleeperUsername(event) {
+    event.preventDefault();
+    if (!sleeperUsername.trim()) {
+      setStatus("Enter a Sleeper username first.");
+      return;
+    }
+
+    setBusy(true);
+    setStatus(`Finding leagues for ${sleeperUsername.trim()}...`);
+    try {
+      const out = await fetchSleeperUserLeagues(sleeperUsername, sleeperSeason);
+      setSleeperUser(out.user);
+      setSleeperLeagues(out.leagues);
+      localStorage.setItem(LS_KEY_USERNAME, sleeperUsername.trim());
+      localStorage.setItem(LS_KEY_LEAGUES, JSON.stringify(out.leagues));
+      setStatus(out.leagues.length > 0
+        ? `Found ${out.leagues.length} Sleeper leagues. Pick one to build.`
+        : "No leagues found for that username.");
+    } catch (err) {
+      setStatus(`Sleeper lookup failed: ${err.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function selectSleeperLeague(league) {
+    const nextLeagueId = String(league?.league_id || "");
+    if (!nextLeagueId) {
+      return;
+    }
+    bootstrappedLeagueRef.current = "";
+    setLeagueId(nextLeagueId);
+    buildDashboard(nextLeagueId);
   }
 
   async function runValuations() {
@@ -537,21 +1245,45 @@ export default function LeagueWorkspace() {
   function renderTabBody() {
     if (tab === "overview") {
       return (
-        <section className="stack">
+        <section className="dashboard-layout">
           <div className="stat-grid">
             <StatCard label="League Players" value={leaguePlayers.length} />
-            <StatCard label="Teams" value={teams.length} />
+            <StatCard label="Teams" value={hub?.teams?.length || teams.length} />
             <StatCard label="Valued Players" value={valuations.length} />
             <StatCard label="My Team" value={myTeam || "-"} />
           </div>
-          <div className="panel stack">
-            <h3>Quick Start</h3>
-            <p className="muted">1) Load league, 2) Run valuations, 3) Open Trade Lab to build and evaluate a package.</p>
-            <div className="row">
-              <button className="button" disabled={busy} onClick={loadLeague} type="button">Load League</button>
-              <button className="button" disabled={busy || leaguePlayers.length === 0} onClick={runValuations} type="button">Run Valuations</button>
-              <button className="button" disabled={busy || valuations.length === 0} onClick={() => setTab("trade")} type="button">Go To Trade Lab</button>
+
+          <div className="dashboard-main-grid">
+            <MyTeamSnapshot
+              teamName={myTeam}
+              teams={teams}
+              players={myTeamValuations}
+              onTeamChange={setMyTeam}
+            />
+            <RankingList title="Radar Rankings" players={topPlayers} />
+            <StandingsBoard teams={hub?.teams || []} />
+            <div className="overview-pair overview-pair--wide">
+              <RankingList title="Best Value Edges" players={valueLeaders} emptyText="Run valuations to find value edges." />
+              <MatchupBoard matchups={hub?.matchups || []} />
             </div>
+
+            <section className="dashboard-card dashboard-card--wide team-power-card">
+              <div className="section-kicker">Team Power</div>
+              <div className="power-list">
+                {teamPower.length === 0 ? <p className="muted">Run valuations to compare team value.</p> : null}
+                {teamPower.map((team, index) => (
+                  <div className="power-row" key={team.team}>
+                    <span>{index + 1}</span>
+                    <strong>{team.team}</strong>
+                    <div className="power-meter">
+                      <span style={{ width: `${Math.min(100, Math.max(8, team.total / Math.max(teamPower[0]?.total || 1, 1) * 100))}%` }} />
+                    </div>
+                    <em>{team.total.toFixed(1)}</em>
+                  </div>
+                ))}
+              </div>
+            </section>
+
           </div>
         </section>
       );
@@ -569,6 +1301,13 @@ export default function LeagueWorkspace() {
     if (tab === "valuations") {
       return (
         <section className="stack">
+          <ValuationStory
+            myTeam={myTeam}
+            topPlayers={topPlayers}
+            valueLeaders={valueLeaders}
+            myTeamPlayers={myTeamValuations}
+            onTrade={() => setTab("trade")}
+          />
           <SortableTable title="My Team Valuations" rows={myTeamValuations} defaultSortKey="risk_adjusted_value" />
           <SortableTable title="League Valuations" rows={valuations} defaultSortKey="risk_adjusted_value" />
         </section>
@@ -578,18 +1317,20 @@ export default function LeagueWorkspace() {
     if (tab === "lineup") {
       return (
         <section className="stack">
-          {!lineup ? (
-            <div className="panel stack">
-              <p className="muted">Run lineup to view starters and bench.</p>
-              <button className="button" disabled={busy || myTeamRoster.length === 0} onClick={runLineup} type="button">Run Lineup</button>
-            </div>
-          ) : (
-            <>
-              <div className="panel"><p><strong>Total Projected:</strong> {lineup.total_projected_points}</p></div>
+          <LineupBoard
+            lineup={lineup}
+            valuations={valuations}
+            teamName={myTeam}
+            teams={teams}
+            onTeamChange={setMyTeam}
+          />
+          {lineup ? (
+            <details className="panel details-panel">
+              <summary>Raw lineup tables</summary>
               <SortableTable title="Starters" rows={lineup.starters || []} defaultSortKey="proj_week" />
               <SortableTable title="Bench" rows={lineup.bench || []} defaultSortKey="proj_week" />
-            </>
-          )}
+            </details>
+          ) : null}
         </section>
       );
     }
@@ -599,16 +1340,32 @@ export default function LeagueWorkspace() {
         <section className="stack">
           <div className="panel stack">
             <h3>Trade Lab</h3>
-            <p className="muted">Step 1: Generate candidates. Step 2: Select send/receive players. Step 3: Evaluate package.</p>
+            <p className="muted">Choose a partner, pick a package, then evaluate whether Radar likes the deal.</p>
             <div className="row">
-              <button className="button" disabled={busy || valuations.length === 0 || !myTeam || !partner} onClick={runTradeTargets} type="button">1. Generate Candidates</button>
-              <button className="button" disabled={busy || !trade} onClick={evaluateTradePackage} type="button">3. Evaluate Package</button>
+              <label className="label grow">
+                My Team
+                <select className="input" value={myTeam} onChange={(e) => setMyTeam(e.target.value)}>
+                  <option value="">Select team...</option>
+                  {teams.map((t) => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="label grow">
+                Trade Partner
+                <select className="input" value={partner} onChange={(e) => setPartner(e.target.value)}>
+                  <option value="">Select partner...</option>
+                  {teams.filter((t) => t !== myTeam).map((t) => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </label>
             </div>
-            <p className="muted">If the strict candidates are empty, full team pools are shown automatically for picking.</p>
+            <p className="muted">Candidates are generated automatically from the loaded dashboard. If strict candidates are empty, full team pools are shown for picking.</p>
           </div>
 
           {!trade ? (
-            <div className="panel"><p className="muted">No trade candidates yet. Click “Generate Candidates”.</p></div>
+            <div className="panel"><p className="muted">Trade candidates are loading from the selected teams.</p></div>
           ) : (
             <>
               <div className="panel">
@@ -622,7 +1379,7 @@ export default function LeagueWorkspace() {
               </div>
 
               <section className="panel stack">
-                <h4>2. Build Package</h4>
+                <h4>Build Package</h4>
                 <div className="row">
                   <div className="pick-col">
                     <p><strong>You Send ({myTeam})</strong></p>
@@ -646,6 +1403,16 @@ export default function LeagueWorkspace() {
                 <div className="row">
                   <p className="muted"><strong>Selected Send:</strong> {selectedSend.join(", ") || "none"}</p>
                   <p className="muted"><strong>Selected Receive:</strong> {selectedReceive.join(", ") || "none"}</p>
+                </div>
+                <div className="row">
+                  <button
+                    className="button primary-action"
+                    disabled={busy || !trade || selectedSend.length === 0 || selectedReceive.length === 0}
+                    onClick={evaluateTradePackage}
+                    type="button"
+                  >
+                    Evaluate Package
+                  </button>
                 </div>
               </section>
 
@@ -677,18 +1444,14 @@ export default function LeagueWorkspace() {
     if (tab === "fa") {
       return (
         <section className="stack">
-          {!fa ? (
-            <div className="panel stack">
-              <p className="muted">Run FA upgrade scan to view suggestions.</p>
-              <button className="button" disabled={busy || myTeamRoster.length === 0} onClick={runFaUpgrades} type="button">Run FA Upgrades</button>
-            </div>
-          ) : (
-            <>
-              <div className="panel"><p><strong>Total Projected:</strong> {fa.total_projected_points}</p></div>
+          <FaBoard fa={fa} />
+          {fa ? (
+            <details className="panel details-panel">
+              <summary>Raw FA tables</summary>
               <SortableTable title="Upgrades" rows={fa.upgrades || []} defaultSortKey="delta_pts" />
               <SortableTable title="FA Pool" rows={fa.fa_pool || []} defaultSortKey="proj_week" />
-            </>
-          )}
+            </details>
+          ) : null}
         </section>
       );
     }
@@ -744,79 +1507,127 @@ export default function LeagueWorkspace() {
   }
 
   return (
-    <main className="shell dark-shell">
-      <div className="topbar panel">
-        <div>
-          <h1>Dynasty Radar</h1>
-          <p className="muted">v2.0</p>
-        </div>
+    <main className="radar-app dark-shell">
+      <ScoreTicker matchups={hub?.matchups || []} />
+
+      <section className="radar-masthead">
+        <button className="brand-lockup" type="button" onClick={() => setTab("overview")} aria-label="Go to Dynasty Radar home">
+          <span>DR</span>
+          <div>
+            <h1>Dynasty Radar</h1>
+            <p>{hub?.league?.name || "Any Sleeper league, one dynasty command center"}</p>
+          </div>
+        </button>
+        <nav className="masthead-nav" aria-label="Radar navigation">
+          <button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")} type="button">Home</button>
+          <button className={tab === "valuations" ? "active" : ""} onClick={() => setTab("valuations")} type="button">Rankings</button>
+          <button className={tab === "trade" ? "active" : ""} onClick={() => setTab("trade")} type="button">Trade Lab</button>
+          <button className={tab === "lineup" ? "active" : ""} onClick={() => setTab("lineup")} type="button">Lineup</button>
+          <button className={tab === "fa" ? "active" : ""} onClick={() => setTab("fa")} type="button">FA</button>
+        </nav>
         <div className="status-chip">
           {busy ? "Working..." : backendReady === false ? "Waking API..." : "Ready"}
         </div>
+      </section>
+
+      <section className="shell">
+      <div className="topbar panel workspace-header">
+        <div>
+          <h2>League Dashboard</h2>
+          <p className="muted">Powered by Radar 2.0</p>
+        </div>
       </div>
 
-      <section className="panel stack">
-        <div className="row">
-          <label className="label grow">
-            Sleeper League ID
-            <input className="input" value={leagueId} onChange={(e) => setLeagueId(e.target.value)} placeholder="1195252934627844096" />
+      <section className="panel control-panel league-id-panel">
+        <form className="league-id-form sleeper-lookup-form" onSubmit={submitSleeperUsername}>
+          <label className="label">
+            Sleeper Username
+            <input
+              className="input"
+              value={sleeperUsername}
+              onChange={(e) => setSleeperUsername(e.target.value)}
+              placeholder="DaGoose"
+            />
           </label>
-        </div>
-        <div className="row">
-          <button className="button" type="button" onClick={() => setShowAdvanced((v) => !v)}>
-            {showAdvanced ? "Hide Advanced" : "Show Advanced"}
+          <label className="label season-field">
+            Season
+            <input
+              className="input"
+              type="number"
+              value={sleeperSeason}
+              onChange={(e) => setSleeperSeason(e.target.value)}
+            />
+          </label>
+          <button className="button primary-action" disabled={busy || !sleeperUsername.trim()} type="submit">
+            {busy ? "Finding..." : sleeperLeagues.length > 0 ? "Refresh Leagues" : "Find Leagues"}
           </button>
-        </div>
-        {showAdvanced ? (
-          <div className="row">
-            <label className="label grow">
-              API Base URL
-              <input className="input" value={apiBase} onChange={(e) => setApiBase(e.target.value)} />
-            </label>
+        </form>
+
+        {sleeperLeagues.length > 0 ? (
+          <div className="league-picker-grid">
+            {sleeperLeagues.map((league) => {
+              const selected = String(league.league_id) === String(leagueId);
+              return (
+                <button
+                  className={`league-picker-card ${selected ? "active" : ""}`}
+                  key={league.league_id}
+                  type="button"
+                  onClick={() => selectSleeperLeague(league)}
+                  disabled={busy}
+                >
+                  <span>{league.season || league.season_type || "NFL"}</span>
+                  <strong>{league.name || `League ${league.league_id}`}</strong>
+                  <p>{league.total_rosters || "-"} teams · {league.status || "league"}</p>
+                </button>
+              );
+            })}
           </div>
         ) : null}
 
-        <div className="row">
-          <label className="label grow">
-            My Team
-            <select className="input" value={myTeam} onChange={(e) => setMyTeam(e.target.value)}>
-              <option value="">Select team...</option>
-              {teams.map((t) => (
-                <option key={t} value={t}>{t}</option>
-              ))}
-            </select>
-          </label>
-          <label className="label grow">
-            Trade Partner
-            <select className="input" value={partner} onChange={(e) => setPartner(e.target.value)}>
-              <option value="">Select partner...</option>
-              {teams.filter((t) => t !== myTeam).map((t) => (
-                <option key={t} value={t}>{t}</option>
-              ))}
-            </select>
-          </label>
-          <label className="label">
-            Superflex
-            <select className="input" value={String(superflex)} onChange={(e) => setSuperflex(e.target.value === "true")}>
-              <option value="true">true</option>
-              <option value="false">false</option>
-            </select>
-          </label>
+        <div className="league-id-meta">
+          <span>
+            {busy
+              ? status
+              : valuations.length > 0
+                ? `${valuations.length} players valued`
+                : sleeperLeagues.length > 0
+                  ? "Pick a league to build your weekly command center."
+                  : "Enter a Sleeper username to find your leagues."}
+          </span>
+          <button className="link-button" type="button" onClick={() => setShowAdvanced((v) => !v)}>
+            {showAdvanced ? "Hide settings" : "Settings"}
+          </button>
         </div>
-
-        <div className="row">
-          <button className="button" disabled={busy} onClick={loadLeague} type="button">Load League</button>
-          <button className="button" disabled={busy || leaguePlayers.length === 0} onClick={runValuations} type="button">Run Valuations</button>
-          <button className="button" disabled={busy || myTeamRoster.length === 0} onClick={runLineup} type="button">Run Lineup</button>
-          <button className="button" disabled={busy || valuations.length === 0 || !partner} onClick={runTradeTargets} type="button">Run Trade</button>
-          <button className="button" disabled={busy || myTeamRoster.length === 0} onClick={runFaUpgrades} type="button">Run FA</button>
-        </div>
-
-        <pre className="pre">{status}</pre>
+        {showAdvanced ? (
+          <>
+            <form className="league-id-form manual-league-form" onSubmit={submitLeagueId}>
+              <label className="label">
+                Sleeper League ID
+                <input className="input" value={leagueId} onChange={(e) => setLeagueId(e.target.value)} placeholder="1195252934627844096" />
+              </label>
+              <button className="button primary-action" disabled={busy || !leagueId.trim()} type="submit">
+                {busy ? "Building..." : valuations.length > 0 ? "Refresh League" : "Load League"}
+              </button>
+            </form>
+            <div className="advanced-settings">
+              <label className="label grow">
+                API Base URL
+                <input className="input" value={apiBase} onChange={(e) => setApiBase(e.target.value)} />
+              </label>
+              <label className="label">
+                Superflex
+                <select className="input" value={String(superflex)} onChange={(e) => setSuperflex(e.target.value === "true")}>
+                  <option value="true">true</option>
+                  <option value="false">false</option>
+                </select>
+              </label>
+            </div>
+          </>
+        ) : null}
       </section>
 
       <nav className="tabbar">
-        {TABS.map((t) => (
+        {TABS.filter((t) => t !== "overview").map((t) => (
           <button
             key={t}
             className={`tab ${tab === t ? "active" : ""}`}
@@ -829,6 +1640,7 @@ export default function LeagueWorkspace() {
       </nav>
 
       {renderTabBody()}
+      </section>
     </main>
   );
 }

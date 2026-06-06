@@ -443,19 +443,33 @@ def build_trade_evaluation(request: TradeEvaluateRequest) -> Dict[str, Any]:
     send_top = float(send_ra.fillna(0.0).max()) if send_count else 0.0
     recv_top = float(recv_ra.fillna(0.0).max()) if recv_count else 0.0
     top_gap = recv_top - send_top
+    ra_gap = float(recv_total_risk_adj - send_total_risk_adj)
+    true_gap = float(receive_total_true - send_total_true)
+    market_gap = float(market_diff)
     warnings: List[str] = []
     if recv_top > (send_top * 1.30) and recv_count <= send_count:
         warnings.append("Star mismatch: package lacks a comparable centerpiece asset.")
     if abs(send_count - recv_count) >= 2:
         warnings.append("Large player-count imbalance can reduce acceptance odds.")
-    if quality_diff > 0 and (recv_total_risk_adj - send_total_risk_adj) > 0:
+    if quality_diff > 0 and ra_gap > 0:
         warnings.append("You receive more consolidated value than you send; likely countered.")
 
-    acceptance = 68.0
-    acceptance -= max(0.0, quality_diff) * 1.15
-    acceptance -= max(0.0, recv_total_risk_adj - send_total_risk_adj) * 0.65
-    acceptance -= max(0.0, top_gap) * 0.90
-    acceptance -= abs(send_count - recv_count) * 4.0
+    acceptance = 62.0
+    acceptance -= max(0.0, quality_diff) * 1.45
+    acceptance -= max(0.0, ra_gap) * 0.95
+    acceptance -= max(0.0, true_gap) * 0.55
+    acceptance -= max(0.0, market_gap) * 0.35
+    acceptance -= max(0.0, top_gap) * 1.10
+    acceptance -= abs(send_count - recv_count) * 5.0
+    if ra_gap >= 15.0 or true_gap >= 20.0 or market_gap >= 20.0:
+        acceptance = min(acceptance, 38.0)
+        warnings.append("Value gap is large enough that the partner probably asks for more.")
+    if quality_diff >= 10.0:
+        acceptance = min(acceptance, 35.0)
+    if top_gap >= 12.0:
+        acceptance = min(acceptance, 32.0)
+    if recv_count > send_count and ra_gap > 0:
+        acceptance -= 8.0
     acceptance = float(np.clip(acceptance, 1.0, 99.0))
     if acceptance >= 70:
         partner_acceptance = "high"
