@@ -186,7 +186,7 @@ def build_valuations(request: ValuationRequest) -> List[Dict[str, Any]]:
 
 
 def _serialize_lineup_frame(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    cols = ["name", "pos", "proj_week", "slot", "team"]
+    cols = ["name", "pos", "proj_week", "slot", "team", "market_value"]
     if df is None or df.empty:
         return []
     safe = df.copy()
@@ -550,8 +550,8 @@ def build_fa_upgrades(request: FAUpgradesRequest) -> Dict[str, Any]:
         max_results=request.max_results,
     )
 
-    fa_cols = ["name", "pos", "proj_week", "team"]
-    upgrades_cols = ["slot", "replace", "add", "proj_add", "proj_replace", "delta_pts", "pos"]
+    fa_cols = ["name", "pos", "proj_week", "team", "market_value"]
+    upgrades_cols = ["slot", "replace", "add", "proj_add", "proj_replace", "delta_pts", "pos", "market_value"]
     return {
         "starters": _serialize_lineup_frame(starters_df),
         "bench": _serialize_lineup_frame(bench_df),

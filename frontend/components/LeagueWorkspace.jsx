@@ -9,6 +9,7 @@ const LS_KEY_HUB = "dynasty_radar_league_hub";
 const LS_KEY_USERNAME = "dynasty_radar_sleeper_username";
 const LS_KEY_LEAGUES = "dynasty_radar_sleeper_leagues";
 const TABS = ["overview", "league", "valuations", "lineup", "trade", "fa", "model"];
+let sleeperPlayerIndexPromise = null;
 
 async function postJson(url, payload) {
   const res = await fetch(url, {
@@ -58,7 +59,7 @@ function avatarUrl(avatar) {
 }
 
 function playerImageUrl(player) {
-  const id = player?.player_id || player?.sleeper_id || player?.id;
+  const id = player?.player_id || player?.sleeper_id || player?.image_id || player?.id;
   return id ? `https://sleepercdn.com/content/nfl/players/${id}.jpg` : "";
 }
 
@@ -88,6 +89,95 @@ function recordFromRoster(roster) {
 
 function rosterPoints(roster, key, decimalKey) {
   return Number(`${roster?.settings?.[key] || 0}.${roster?.settings?.[decimalKey] || 0}`);
+}
+
+function lineupConfigFromRosterPositions(rosterPositions = []) {
+  if (!Array.isArray(rosterPositions) || rosterPositions.length === 0) {
+    return null;
+  }
+
+  const config = { qb: 0, rb: 0, wr: 0, te: 0, flex: 0, superflex: 0, k: 0, te_premium: false };
+  for (const rawSlot of rosterPositions) {
+    const slot = String(rawSlot || "").toUpperCase();
+    if (slot === "QB") config.qb += 1;
+    if (slot === "RB") config.rb += 1;
+    if (slot === "WR") config.wr += 1;
+    if (slot === "TE") config.te += 1;
+    if (slot === "K") config.k += 1;
+    if (["FLEX", "WRRB_FLEX", "REC_FLEX"].includes(slot)) config.flex += 1;
+    if (["SUPER_FLEX", "SFLEX", "OP"].includes(slot)) config.superflex += 1;
+  }
+
+  const starterCount = config.qb + config.rb + config.wr + config.te + config.flex + config.superflex + config.k;
+  return starterCount > 0 ? config : null;
+}
+
+function normalizeName(name) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, " ")
+    .replace(/\b(jr|sr|ii|iii|iv|v)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sleeperPlayerLookupKey(name, pos) {
+  return `${normalizeName(name)}::${String(pos || "").toUpperCase()}`;
+}
+
+async function fetchSleeperPlayerIndex() {
+  if (!sleeperPlayerIndexPromise) {
+    sleeperPlayerIndexPromise = getJson("https://api.sleeper.app/v1/players/nfl").then((players) => {
+      const index = new Map();
+      for (const [playerId, player] of Object.entries(players || {})) {
+        const pos = player?.position;
+        if (!["QB", "RB", "WR", "TE", "K"].includes(pos)) {
+          continue;
+        }
+        const names = [
+          player?.full_name,
+          player?.search_full_name,
+          [player?.first_name, player?.last_name].filter(Boolean).join(" "),
+        ];
+        for (const name of names) {
+          if (!normalizeName(name)) {
+            continue;
+          }
+          const key = sleeperPlayerLookupKey(name, pos);
+          if (!index.has(key)) {
+            index.set(key, {
+              player_id: playerId,
+              sleeper_id: playerId,
+              team: player?.team || "",
+            });
+          }
+        }
+      }
+      return index;
+    });
+  }
+  return sleeperPlayerIndexPromise;
+}
+
+function enrichFreeAgentsWithSleeperIds(faResponse, playerIndex) {
+  if (!faResponse || !playerIndex) {
+    return faResponse;
+  }
+  const enrich = (player) => {
+    const match = playerIndex.get(sleeperPlayerLookupKey(player?.name, player?.pos));
+    if (!match) {
+      return player;
+    }
+    return {
+      ...player,
+      image_id: match.player_id,
+      team: player.team || match.team,
+    };
+  };
+  return {
+    ...faResponse,
+    fa_pool: (faResponse.fa_pool || []).map(enrich),
+  };
 }
 
 async function fetchSleeperHub(leagueId, week = 1) {
@@ -221,7 +311,12 @@ function ScoreTicker({ matchups }) {
   );
 }
 
-function RankingList({ title, players, emptyText = "Run valuations to fill this board." }) {
+function RankingList({
+  title,
+  players,
+  emptyText = "Run valuations to fill this board.",
+  valueAccessor = (player) => Number(player.risk_adjusted_value || player.true_value || 0),
+}) {
   return (
     <section className="dashboard-card">
       <div className="section-kicker">{title}</div>
@@ -235,7 +330,7 @@ function RankingList({ title, players, emptyText = "Run valuations to fill this 
               <strong>{player.name}</strong>
               <p>{player.pos || "-"} {player.team ? `- ${player.team}` : ""}</p>
             </div>
-            <em>{Number(player.risk_adjusted_value || player.true_value || 0).toFixed(1)}</em>
+            <em>{Number(valueAccessor(player) || 0).toFixed(1)}</em>
           </div>
         ))}
       </div>
@@ -386,44 +481,22 @@ function LineupBoard({ lineup, valuations, teamName, teams, onTeamChange }) {
 }
 
 function FaBoard({ fa }) {
-  const upgrades = fa?.upgrades || [];
-  const faPool = fa?.fa_pool || [];
+  const faPool = [...(fa?.fa_pool || [])]
+    .sort((a, b) => Number(b.market_value || 0) - Number(a.market_value || 0));
 
   return (
     <section className="dashboard-card dashboard-card--wide fa-board">
-      <div className="section-kicker">Free-Agent Upgrades</div>
-      {!fa ? <p className="muted">FA upgrades will load automatically with the dashboard.</p> : null}
+      <div className="section-kicker">Free-Agent Market Edge</div>
+      {!fa ? <p className="muted">Free-agent values will load automatically with the dashboard.</p> : null}
       {fa ? (
         <>
-          <div className="lineup-total">
-            <strong>{Number(fa.total_projected_points || 0).toFixed(1)}</strong>
-            <span>current projected team points</span>
-          </div>
-          <div className="fa-upgrade-grid">
-            {upgrades.slice(0, 8).map((item, index) => {
-              const add = item.add || item.free_agent || item.fa || item;
-              const drop = item.drop || item.replace || item.roster_player;
-              return (
-                <div className="fa-card" key={`${add?.name || index}-${drop?.name || index}`}>
-                  <div>
-                    <span>Add</span>
-                    <strong>{add?.name || item.name || "Free agent"}</strong>
-                    <p>{add?.pos || item.pos || "-"} {add?.team || item.team ? `- ${add?.team || item.team}` : ""}</p>
-                  </div>
-                  <em>+{Number(item.delta_pts || item.delta || 0).toFixed(1)}</em>
-                  {drop ? (
-                    <div>
-                      <span>Drop</span>
-                      <strong>{drop.name}</strong>
-                      <p>{drop.pos || "-"} {drop.team ? `- ${drop.team}` : ""}</p>
-                    </div>
-                  ) : null}
-                </div>
-              );
-            })}
-            {upgrades.length === 0 ? <p className="muted">No obvious upgrades found yet.</p> : null}
-          </div>
-          <RankingList title="Best Available Players" players={faPool.slice(0, 12)} emptyText="No free-agent pool returned." />
+          <RankingList
+            title="Best Available Players"
+            players={faPool.slice(0, 12)}
+            emptyText="No free-agent pool returned."
+            valueAccessor={(player) => player.market_value}
+          />
+          <SortableTable title="Sortable Market Edge" rows={faPool} defaultSortKey="market_value" />
         </>
       ) : null}
     </section>
@@ -511,7 +584,8 @@ function SortableTable({ title, rows, defaultSortKey, limit = 60 }) {
   const [sortKey, setSortKey] = useState(defaultSortKey || "");
   const [sortDir, setSortDir] = useState("desc");
 
-  const keys = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
+  const hiddenKeys = new Set(["image_id", "player_id", "sleeper_id", "id"]);
+  const keys = rows && rows.length > 0 ? Object.keys(rows[0]).filter((key) => !hiddenKeys.has(key)) : [];
 
   useEffect(() => {
     if (!sortKey && keys.length > 0) {
@@ -745,6 +819,11 @@ export default function LeagueWorkspace() {
     [valuations, myTeam]
   );
 
+  const leagueLineupConfig = useMemo(
+    () => lineupConfigFromRosterPositions(hub?.league?.roster_positions),
+    [hub]
+  );
+
   const topPlayers = useMemo(() => {
     return [...valuations]
       .sort((a, b) => Number(b.risk_adjusted_value || b.true_value || 0) - Number(a.risk_adjusted_value || a.true_value || 0))
@@ -809,13 +888,13 @@ export default function LeagueWorkspace() {
     if (tab !== "lineup" || busy || valuations.length === 0 || !myTeam || myTeamRoster.length === 0) {
       return;
     }
-    const key = `${myTeam}::${valuations.length}::${superflex}`;
+    const key = `${myTeam}::${valuations.length}::${superflex}::${JSON.stringify(leagueLineupConfig || {})}`;
     if (lineupAutoKeyRef.current === key) {
       return;
     }
     lineupAutoKeyRef.current = key;
     runLineup();
-  }, [tab, myTeam, valuations.length, myTeamRoster.length, superflex]);
+  }, [tab, myTeam, valuations.length, myTeamRoster.length, superflex, leagueLineupConfig]);
 
   function tabLabel(t) {
     const map = {
@@ -877,17 +956,20 @@ export default function LeagueWorkspace() {
     try {
       const trimmedLeagueId = String(nextLeagueId).trim();
       setLeagueId(trimmedLeagueId);
-      const [out, sleeperHub, outMkt] = await Promise.all([
+      const [out, sleeperHub, outMkt, sleeperPlayerIndex] = await Promise.all([
         postJson(`${apiBase}/v1/league/load`, { league_id: trimmedLeagueId }),
         fetchSleeperHub(trimmedLeagueId).catch(() => null),
         market.length > 0 ? Promise.resolve({ players: market }) : getJson(`${apiBase}/v1/market/default`),
+        fetchSleeperPlayerIndex().catch(() => null),
       ]);
       const players = out.players || [];
       const mkt = outMkt.players || [];
+      const dashboardLineupConfig = lineupConfigFromRosterPositions(sleeperHub?.league?.roster_positions);
+      const dashboardSuperflex = dashboardLineupConfig ? dashboardLineupConfig.superflex > 0 : superflex;
       const outVals = await postJson(`${apiBase}/v1/valuations`, {
         roster: players,
         market: mkt,
-        superflex,
+        superflex: dashboardSuperflex,
         ppr: true,
       });
       const valuedPlayers = outVals.players || [];
@@ -929,10 +1011,19 @@ export default function LeagueWorkspace() {
               market_value: valMap.get(k) || marketMap.get(k) || 0,
             };
           }),
-          superflex,
+          config: dashboardLineupConfig || undefined,
+          superflex: dashboardSuperflex,
         }) : Promise.resolve(null),
         defaultRoster.length > 0 ? postJson(`${apiBase}/v1/fa/upgrades`, {
-          roster: defaultRoster.map((p) => ({ name: p.name, pos: p.pos, team: p.team })),
+          roster: defaultRoster.map((p) => {
+            const k = valueKey(p.name, p.pos);
+            return {
+              name: p.name,
+              pos: p.pos,
+              team: p.team,
+              market_value: valMap.get(k) || marketMap.get(k) || 0,
+            };
+          }),
           league_roster: players.map((p) => ({
             name: p.name,
             pos: p.pos,
@@ -940,7 +1031,8 @@ export default function LeagueWorkspace() {
             team: p.team,
           })),
           dp_market: mkt,
-          superflex,
+          config: dashboardLineupConfig || undefined,
+          superflex: dashboardSuperflex,
         }) : Promise.resolve(null),
         defaultTeam && defaultPartner ? postJson(`${apiBase}/v1/trade/targets`, {
           my_team: defaultTeam,
@@ -957,7 +1049,7 @@ export default function LeagueWorkspace() {
       setLineup(lineupResult.status === "fulfilled" ? lineupResult.value : null);
       setTrade(tradeResult.status === "fulfilled" ? tradeResult.value : null);
       setTradeEval(null);
-      setFa(faResult.status === "fulfilled" ? faResult.value : null);
+      setFa(faResult.status === "fulfilled" ? enrichFreeAgentsWithSleeperIds(faResult.value, sleeperPlayerIndex) : null);
       setSelectedSend([]);
       setSelectedReceive([]);
       localStorage.setItem(LS_KEY, JSON.stringify(players));
@@ -1033,7 +1125,7 @@ export default function LeagueWorkspace() {
       const out = await postJson(`${apiBase}/v1/valuations`, {
         roster: leaguePlayers,
         market: mkt,
-        superflex,
+        superflex: leagueLineupConfig ? leagueLineupConfig.superflex > 0 : superflex,
         ppr: true,
       });
       setValuations(out.players || []);
@@ -1078,7 +1170,8 @@ export default function LeagueWorkspace() {
             market_value: valMap.get(k) || marketMap.get(k) || 0,
           };
         }),
-        superflex,
+        config: leagueLineupConfig || undefined,
+        superflex: leagueLineupConfig ? leagueLineupConfig.superflex > 0 : superflex,
       });
       setLineup(out);
       setStatus("Lineup complete.");
@@ -1201,8 +1294,19 @@ export default function LeagueWorkspace() {
         mkt = outMkt.players || [];
         setMarket(mkt);
       }
-      const out = await postJson(`${apiBase}/v1/fa/upgrades`, {
-        roster: myTeamRoster.map((p) => ({ name: p.name, pos: p.pos, team: p.team })),
+      const [out, sleeperPlayerIndex] = await Promise.all([
+        postJson(`${apiBase}/v1/fa/upgrades`, {
+        roster: myTeamRoster.map((p) => {
+          const k = valueKey(p.name, p.pos);
+          const match = valuations.find((v) => v.display_name === myTeam && valueKey(v.name, v.pos) === k);
+          const marketMatch = mkt.find((v) => valueKey(v.name, v.pos) === k);
+          return {
+            name: p.name,
+            pos: p.pos,
+            team: p.team,
+            market_value: Number(match?.market_value || marketMatch?.market_value || 0),
+          };
+        }),
         league_roster: leaguePlayers.map((p) => ({
           name: p.name,
           pos: p.pos,
@@ -1210,9 +1314,12 @@ export default function LeagueWorkspace() {
           team: p.team,
         })),
         dp_market: mkt,
-        superflex,
-      });
-      setFa(out);
+        config: leagueLineupConfig || undefined,
+        superflex: leagueLineupConfig ? leagueLineupConfig.superflex > 0 : superflex,
+        }),
+        fetchSleeperPlayerIndex().catch(() => null),
+      ]);
+      setFa(enrichFreeAgentsWithSleeperIds(out, sleeperPlayerIndex));
       setStatus("FA upgrades complete.");
       setTab("fa");
     } catch (err) {
@@ -1447,9 +1554,8 @@ export default function LeagueWorkspace() {
           <FaBoard fa={fa} />
           {fa ? (
             <details className="panel details-panel">
-              <summary>Raw FA tables</summary>
-              <SortableTable title="Upgrades" rows={fa.upgrades || []} defaultSortKey="delta_pts" />
-              <SortableTable title="FA Pool" rows={fa.fa_pool || []} defaultSortKey="proj_week" />
+              <summary>Raw FA market table</summary>
+              <SortableTable title="FA Pool" rows={fa.fa_pool || []} defaultSortKey="market_value" />
             </details>
           ) : null}
         </section>

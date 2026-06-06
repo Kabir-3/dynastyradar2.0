@@ -120,6 +120,7 @@ class LineupPlayerView(BaseModel):
     proj_week: float
     slot: Optional[str] = None
     team: Optional[str] = None
+    market_value: Optional[float] = None
 
 
 class LineupRecommendResponse(BaseModel):
@@ -258,6 +259,7 @@ class FAUpgrade(BaseModel):
     proj_replace: float
     delta_pts: float
     pos: str
+    market_value: Optional[float] = None
 
 
 class FAUpgradesResponse(BaseModel):

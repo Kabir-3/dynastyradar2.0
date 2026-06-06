@@ -332,9 +332,9 @@ def fa_upgrade_suggestions(
     """
     For each lineup slot type, find FA(s) who beat your current worst starter by >= min_delta.
     Returns a concise table (empty-safe) sorted by delta_pts desc (up to max_results).
-    Columns: ["slot","replace","add","proj_add","proj_replace","delta_pts","pos"]
+    Columns: ["slot","replace","add","proj_add","proj_replace","delta_pts","pos","market_value"]
     """
-    cols = ["slot", "replace", "add", "proj_add", "proj_replace", "delta_pts", "pos"]
+    cols = ["slot", "replace", "add", "proj_add", "proj_replace", "delta_pts", "pos", "market_value"]
     if starters_df is None or starters_df.empty or fa_df is None or fa_df.empty:
         return pd.DataFrame(columns=cols)
 
@@ -374,6 +374,7 @@ def fa_upgrade_suggestions(
                 "proj_replace": round(float(worst["proj_week"]), 2),
                 "delta_pts": round(delta, 2),
                 "pos": best.get("pos"),
+                "market_value": round(float(best.get("market_value", 0.0) or 0.0), 2),
             })
 
     # fixed positions
